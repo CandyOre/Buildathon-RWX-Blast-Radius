@@ -1,12 +1,30 @@
 # RWX Buildathon · Blast Radius
 
-This entry runs the full SQLGlot test suite for each patch and minimizes its simulated CI cost by choosing the worker count and test assignment.
+This entry selects SQLGlot tests from patch impact evidence and schedules the selected tests under the scorer's cost model. On the 30 public patches it scores **134.959 simulated seconds with 0 misses**, compared with **139.911 seconds** before narrowing T-SQL configuration reads and **1,104.510 seconds** with the same scheduler running the full suite. Hidden patches are independently evaluated.
+
+## Test selection
+
+`impact.py` verifies unified diffs against the pinned source, compares the old and new Python ASTs, and looks up baseline execution for changed function bodies. The index combines the original pytest contexts with coverage attributed to spawned process-pool jobs. It also records fixture readers, raw Python source readers, declaration use sites and related dialects. Serializer and deserializer references in `__reduce__` connect coverage across process boundaries. Unfamiliar patch formats, paths and changes to imports or declaration shape use the full suite.
+
+Dictionary key changes and set membership changes in declarations take the full-suite fallback because dependent classes may require an inherited entry while importing. The source audit distinguishes file opens made by the Python loader from direct source reads. It reclassifies an older, untagged read only when both full-manifest and isolated observations identify the same test and path as an import. Confirmed direct readers are always kept.
+
+The configuration-read index is enabled for `TSQL.WEEK_OFFSET`. It records the owning class and test for each measured read, including reads in spawned pool tasks. An isolated integer value edit can use those readers plus raw source readers and tests whose coverage is missing. Unattributed or unresolved reads prevent the builder from enabling the affected target.
+
+For a local expression edit inside a stable statement, the selector looks for tests that enter the entire statement or condition. This includes the beginning of a short-circuit condition even when its modified operand was skipped on the baseline. It keeps cheap function-level candidates and uses whole-function coverage where execution was unattributed, serialization is involved, or the finer evidence is missing.
+
+The optional predicate index measures whether native equality and identity agree on operands seen by the pinned test suite. It only uses sites where the probe recorded agreement and corroborated subprocess execution where applicable. The shortcut requires the entire patch to preserve its operands and change only the comparison operators in one file. Raw source readers and tests with missing coverage still run.
+
+`impact_index.json.gz` is generated from the unpatched SQLGlot checkout and test manifest. The runtime matches coverage by pytest node ID to use the test numbers supplied with the current batch. The image contains the selector and index and makes its decisions offline without running pytest. Public answers are used by the separate local scorer.
 
 ## Scheduling
 
-`selector.py` reads the recorded durations from `tests.json` and uses integer milliseconds. For each eligible worker count, the longest test and the rounded-up average load give a lower bound on the busiest worker's load. A longest-first assignment gives a feasible upper bound. When those bounds leave room to improve the best score, the scheduler searches for an exact partition, exploring only one representative of each equivalent worker state.
+`scheduler.py` reads the recorded durations in integer milliseconds. For each eligible worker count, the longest test and the rounded-up average load give a lower bound on the busiest worker's load. A longest-first assignment gives a feasible upper bound. When those bounds leave room to improve the score, the scheduler explores one representative of each equivalent worker state. The entry point caps that search per distinct test set and keeps the best feasible assignment it has found.
 
-The 30 public patches each use 4 workers. The busiest worker takes 28.817 seconds, so each patch costs 36.817 seconds after worker overhead. The sample score is **1,104.510 simulated seconds with 0 misses**, compared with 1,210.470 seconds for the fixed three-worker starter. The full-suite assignment reaches the lower bound and needs zero partition searches.
+The selector then fills spare capacity with tests that exercised the edited files. These tests occupy existing workers only up to the current busiest load, preserving the simulated cost. `--explain` reports the number added as `filled_spare_capacity`.
+
+If the cached full-suite schedule costs no more than the selected schedule, the selector uses the full suite.
+
+The full-suite comparison uses four workers and reaches the lower bound of 36.817 seconds per patch. Run it with `--all-tests`.
 
 ## The problem
 
@@ -45,11 +63,52 @@ make check    # the output's format only
 To run the selector directly with Python in PowerShell 7:
 
 ```powershell
-python selector.py --data-dir sample > output.jsonl
+python selector.py --data-dir sample --explain > output.jsonl
 python score.py sample sample/answers.json output.jsonl
 ```
 
 This uses the same sample scorer. `make sample` also checks the Linux container under the scorer's resource limits.
+
+`--explain` reports the selection rules and candidate count on stderr. The index rebuild steps below use the local `analysis/` workspace. First collect baseline coverage using the Reproduction section of `analysis/analysis_report.md`. Repeat that coverage command with `--process-contexts`, a separate scratch directory, and `--output /analysis/.work/coverage-with-workers.json.gz`. Use a fresh scratch directory for the comparison probe so results from previous runs cannot enter the index.
+
+```powershell
+docker run --rm --platform linux/amd64 --network none --cpus 4 --memory 8g `
+    --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/analysis/predicate_probe:/src `
+    --env BLAST_RADIUS_PREDICATE_SOURCE=/src `
+    --env BLAST_RADIUS_PREDICATE_RAW=/analysis/.work/predicate-verified-raw `
+    --mount "type=bind,source=$analysisRoot,target=/analysis" `
+    --mount "type=bind,source=$sourceRoot,target=/src,readonly" `
+    --mount "type=bind,source=$sampleRoot,target=/sample,readonly" `
+    blast-radius-analysis-coverage python /analysis/collect_predicates.py `
+    --catalog /sample/tests.json --output /analysis/.work/predicate-verified.json
+```
+
+Merge the baseline runs from the repository root. Leaving out `--predicate-observations` builds the coverage-only comparison index.
+
+```powershell
+python analysis/build_impact_index.py --source analysis/.work/sqlglot `
+    --coverage analysis/.work/coverage-with-workers.json.gz `
+    --parent-coverage analysis/coverage.json.gz `
+    --predicate-observations analysis/.work/predicate-verified.json --output impact_index.json.gz
+```
+
+For the source provenance correction, run the coverage collector with `--source-audit` and write to `analysis/.work/manifest-source-audit.json.gz`. Run it in a fresh container with `--source-audit --test-number 27` to produce `analysis/.work/cold-source-audit.json.gz`. Use separate scratch directories and add `--source-audit analysis/.work/manifest-source-audit.json.gz --cold-source-audit analysis/.work/cold-source-audit.json.gz` to the index builder command.
+
+To collect the owner-specific configuration reads, use a fresh scratch directory.
+
+```powershell
+docker run --rm --platform linux/amd64 --network none --cpus 4 --memory 8g `
+    --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONPATH=/analysis/predicate_probe:/src `
+    --env BLAST_RADIUS_CONFIG_SOURCE=/src --env BLAST_RADIUS_CONFIG_FIELDS=WEEK_OFFSET `
+    --env BLAST_RADIUS_CONFIG_RAW=/analysis/.work/week-offset-raw `
+    --mount "type=bind,source=$analysisRoot,target=/analysis" `
+    --mount "type=bind,source=$sourceRoot,target=/src,readonly" `
+    --mount "type=bind,source=$sampleRoot,target=/sample,readonly" `
+    blast-radius-analysis-coverage python /analysis/collect_config_reads.py `
+    --catalog /sample/tests.json --output /analysis/.work/week-offset-observations.json
+```
+
+Pass `--configuration-reads analysis/.work/week-offset-observations.json --configuration-target sqlglot.dialects.tsql:TSQL:WEEK_OFFSET` to the index builder. The independent mutations are `tsql-week-offset-zero` and `oracle-week-offset-positive` in `analysis/validate_impact.py`.
 
 `sample/answers.json` lists the tests each sample commit breaks and the kind of change it is. The practice and final commits are hidden, and so is everything your program prints when it runs on them. A rejected submission tells you which rule it broke and nothing more, so reproduce problems here.
 

@@ -1,133 +1,56 @@
-"""Run every test on every commit with a cost-aware worker assignment."""
+"""Select and schedule tests for each independent SQLGlot patch."""
 
 import argparse
-import heapq
 import json
-import math
 import sys
 from pathlib import Path
-from typing import Optional
+
+from impact import ImpactIndex, Selection
+from scheduler import fill_spare_capacity, schedule, schedule_cost, test_milliseconds
 
 DATA = Path("/data")
-MAXIMUM_WORKERS = 8
-WORKER_COST_MILLISECONDS = 2_000
-
-
-def _split(ordered_tests: list[tuple[int, int]], worker_count: int) -> tuple[list[list[int]], int]:
-    """Assign longest tests first and return the workers and busiest load."""
-    # Start each worker with a test so even a zero-duration test occupies a worker.
-    first_tests = ordered_tests[:worker_count]
-    workers = [[number] for number, _ in first_tests]
-    loads = [(duration, index) for index, (_, duration) in enumerate(first_tests)]
-    heapq.heapify(loads)
-    for number, duration in ordered_tests[worker_count:]:
-        load, index = loads[0]
-        workers[index].append(number)
-        heapq.heapreplace(loads, (load + duration, index))
-    return workers, max(load for load, _ in loads)
-
-
-def _pack(
-    ordered_tests: list[tuple[int, int]], worker_count: int, limit: int
-) -> Optional[list[list[int]]]:
-    """Find a partition whose busiest worker stays within limit, if one exists."""
-    # An explicit stack also handles manifests longer than Python's recursion limit.
-    stack = [(0, (limit,) * worker_count, None)]
-    seen = set()
-    while stack:
-        test_index, capacities, placement = stack.pop()
-        if test_index == len(ordered_tests):
-            workers: list[list[int]] = [[] for _ in range(worker_count)]
-            for number, _ in reversed(ordered_tests):
-                worker, placement = placement
-                workers[worker].append(number)
-            # Filling empty workers from the largest group cannot increase the load.
-            for worker in workers:
-                if not worker:
-                    worker.append(max(workers, key=len).pop())
-            for worker in workers:
-                worker.reverse()
-            return workers
-
-        # Worker labels do not affect feasibility. Search each capacity state once.
-        state = (test_index, tuple(sorted(capacities)))
-        if state in seen:
-            continue
-        seen.add(state)
-
-        _, duration = ordered_tests[test_index]
-        tried = set()
-        # Stack order tries the tightest fit first.
-        for worker in sorted(range(worker_count), key=capacities.__getitem__, reverse=True):
-            capacity = capacities[worker]
-            if capacity < duration:
-                break
-            if capacity in tried:
-                continue
-            tried.add(capacity)
-            remaining = capacities[:worker] + (capacity - duration,) + capacities[worker + 1:]
-            stack.append((test_index + 1, remaining, (worker, placement)))
-
-    return None
-
-
-def schedule(tests: list[dict]) -> list[list[int]]:
-    """Minimize the scorer's cost, breaking ties in favor of fewer workers."""
-    if not tests:
-        return []
-
-    ordered_tests = sorted(
-        ((test["number"], math.floor(test["seconds"] * 1000 + 0.5)) for test in tests),
-        key=lambda test: (-test[1], test[0]),
-    )
-    total_duration = sum(duration for _, duration in ordered_tests)
-    longest_test = ordered_tests[0][1]
-    best_workers = [[number for number, _ in ordered_tests]]
-    best_cost = total_duration + WORKER_COST_MILLISECONDS
-
-    for worker_count in range(2, min(MAXIMUM_WORKERS, len(ordered_tests)) + 1):
-        overhead = worker_count * WORKER_COST_MILLISECONDS
-        average_load = (total_duration + worker_count - 1) // worker_count
-        lower_bound = max(longest_test, average_load)
-        if lower_bound + overhead >= best_cost:
-            continue
-
-        workers, busiest_load = _split(ordered_tests, worker_count)
-        cost = busiest_load + overhead
-        if cost < best_cost:
-            best_workers = workers
-            best_cost = cost
-
-        # Only search loads that could beat the best score already found.
-        upper_bound = best_cost - overhead - 1
-        while lower_bound <= upper_bound:
-            limit = (lower_bound + upper_bound) // 2
-            workers = _pack(ordered_tests, worker_count, limit)
-            if workers is None:
-                lower_bound = limit + 1
-            else:
-                best_workers = workers
-                best_cost = limit + overhead
-                upper_bound = limit - 1
-
-    return best_workers
+INDEX = Path(__file__).with_name("impact_index.json.gz")
+PARTITION_SEARCH_BUDGET = 2_000
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Select tests for each input patch.")
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=DATA,
-        help="directory containing tests.json and commits/",
-    )
-    data_dir = parser.parse_args().data_dir
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", type=Path, default=DATA)
+    parser.add_argument("--impact-index", type=Path, default=INDEX)
+    parser.add_argument("--all-tests", action="store_true", help="schedule the full suite for every patch")
+    parser.add_argument("--explain", action="store_true", help="write the selection evidence to stderr")
+    args = parser.parse_args()
+    tests = json.loads((args.data_dir / "tests.json").read_text(encoding="utf-8"))["tests"]
 
-    tests = json.loads((data_dir / "tests.json").read_text(encoding="utf-8"))["tests"]
-    workers = schedule(tests)
-    for patch in sorted((data_dir / "commits").glob("*.patch")):
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
-    print(f"selected {len(tests)} tests on {len(workers)} workers per commit", file=sys.stderr)
+    index = None
+    if not args.all_tests:
+        try:
+            index = ImpactIndex(args.impact_index, tests)
+        except (OSError, EOFError, ValueError, KeyError) as error:
+            print(f"Impact index unavailable. Scheduling the full suite. {error}", file=sys.stderr)
+
+    durations = {test["number"]: test_milliseconds(test) for test in tests}
+    full_key = tuple(sorted(durations))
+    full_workers = schedule(tests, search_budget=PARTITION_SEARCH_BUDGET)
+    full_cost = schedule_cost(full_workers, durations)
+    schedules = {full_key: (full_workers, full_cost)}
+    for patch in sorted((args.data_dir / "commits").glob("*.patch")):
+        selection = index.selection(patch, tests) if index else Selection(tests, [], {"full-suite": True})
+        key = tuple(sorted(test["number"] for test in selection.tests))
+        if key not in schedules:
+            workers = schedule(selection.tests, search_budget=PARTITION_SEARCH_BUDGET)
+            schedules[key] = (workers, schedule_cost(workers, durations))
+        workers, cost = schedules[key]
+        if key != full_key and cost >= full_cost:
+            selection = Selection(tests, [], {"full-suite": "equal or lower simulated cost"})
+            workers = full_workers
+        workers = fill_spare_capacity(workers, selection.tests, selection.nearby)
+        print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
+        if args.explain:
+            selected = sum(map(len, workers))
+            print(json.dumps({"commit": patch.stem, "selected": selected, "workers": len(workers),
+                              "filled_spare_capacity": selected - len(selection.tests),
+                              "evidence": selection.evidence}, separators=(",", ":")), file=sys.stderr)
 
 
 if __name__ == "__main__":
