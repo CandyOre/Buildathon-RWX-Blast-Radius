@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from equivalent_edits import normalize_module_tail
 from patch_diff import UnsupportedPatch, parse_patch
 from scheduler import WORKER_COST_MILLISECONDS, test_milliseconds
 
@@ -17,6 +18,7 @@ REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 CONTAINERS = (ast.Dict, ast.List, ast.Tuple, ast.Set)
 EQUALITY_FOR = {ast.Is: ast.Eq, ast.IsNot: ast.NotEq}
+BOUNDARY_FOR = {ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE, ast.GtE: ast.Gt}
 
 
 @dataclass
@@ -34,6 +36,7 @@ class BindingChange:
     container: bool
     integer_value: bool
     requires_readers: bool
+    eager_call: bool
 
 
 @dataclass
@@ -66,6 +69,30 @@ def observed_equalities_only(old, new, sites):
         return len(old) == len(new) and all(observed_equalities_only(left, right, sites)
                                             for left, right in zip(old, new))
     return old == new
+
+
+def single_integer_operator_site(old, new):
+    """Return the old location if exactly one ordered operator changed."""
+    pending = [(old, new)]
+    site = None
+    while pending:
+        left, right = pending.pop()
+        if type(left) is not type(right):
+            return None
+        if (isinstance(left, ast.Compare) and len(left.ops) == len(right.ops) == 1
+                and BOUNDARY_FOR.get(type(left.ops[0])) is type(right.ops[0])):
+            if site or not same_syntax(left.left, right.left) or not same_syntax(left.comparators, right.comparators):
+                return None
+            site = f"{left.lineno}:{left.col_offset}"
+        elif isinstance(left, ast.AST):
+            pending.extend((value, getattr(right, name)) for name, value in ast.iter_fields(left))
+        elif isinstance(left, list):
+            if len(left) != len(right):
+                return None
+            pending.extend(zip(left, right))
+        elif left != right:
+            return None
+    return site
 
 
 def safe_value_change(old, new, factories):
@@ -119,7 +146,8 @@ def changed_binding(old, new, owner, factories, configuration_readers):
             if not ordinary_change and not observed_integer:
                 return None
             return BindingChange(left.id, owner, isinstance(old.value, CONTAINERS),
-                                 integer_value, not ordinary_change)
+                                 integer_value, not ordinary_change,
+                                 eager_calls(old.value, factories) != eager_calls(new.value, factories))
     return None
 
 
@@ -223,8 +251,39 @@ def statement_regions(before, after):
     return regions
 
 
+def eager_calls(node, factories):
+    if isinstance(node, ast.Lambda):
+        return eager_calls(node.args, factories)
+    if isinstance(node, ast.Call) and not (isinstance(node.func, ast.Name) and node.func.id in factories):
+        return [ast.dump(node)]
+    return [call for child in ast.iter_child_nodes(node) for call in eager_calls(child, factories)] if node else []
+
+
+def is_eager(function, lines):
+    return min([function.lineno, *(decorator.lineno for decorator in function.decorator_list)]) in lines
+
+
+def deferred_functions(old, new, eager_lines):
+    """Allow local edits in uncalled closures while preserving their creation."""
+    if len(old.body) != len(new.body):
+        return None
+    changes = []
+    for before, after in zip(old.body, new.body):
+        if same_syntax(before, after):
+            continue
+        if not isinstance(before, FUNCTION) or type(before) is not type(after):
+            return None
+        if not all(same_syntax(value, getattr(after, name)) for name, value in ast.iter_fields(before)
+                   if name != "body"):
+            return None
+        if is_eager(before, eager_lines) or not statement_regions(before.body, after.body):
+            return None
+        changes.append((before, after))
+    return changes
+
+
 class ImpactIndex:
-    def __init__(self, path: Path, tests: list[dict]):
+    def __init__(self, path: Path, tests: list[dict], *, module_pass=True, integer_comparisons=True):
         with gzip.open(path, "rt", encoding="utf-8") as stream:
             self.index = json.load(stream)
         if self.index["version"] != 1 or self.index["revision"] != REVISION:
@@ -234,6 +293,9 @@ class ImpactIndex:
                       for test in tests if test["id"] in test_positions]
         self.unknown = [test for test in tests if test["id"] not in test_positions]
         self.uncovered = int(self.index["uncovered"], 16)
+        self.position_observers = self.index.get("position_observers")
+        self.module_pass = module_pass
+        self.integer_sites = self.index.get("integer_comparison_sites", {}) if integer_comparisons else {}
         self.cheap = 0
         for bit, _, milliseconds in self.known:
             if milliseconds <= WORKER_COST_MILLISECONDS // 20:
@@ -284,29 +346,56 @@ class ImpactIndex:
         old = self.trees[path]
         new = ast.parse(patched.encode("utf-8"), filename=path, type_comments=True)
         readers = int(evidence["readers"], 16)
+        normalized, rejected = normalize_module_tail(old, new, patched, path) if self.module_pass else (None, None)
+        reason_suffix = ""
+        if normalized:
+            effective, positions_changed = normalized
+            if positions_changed and self.position_observers is None:
+                rejected = "module positions changed without observer data"
+            else:
+                new = effective
+                reason_suffix = "+compiled-module-pass"
+                if positions_changed:
+                    readers |= int(self.position_observers, 16) | self.uncovered
         if same_syntax(old, new):
-            return readers, 0, "unchanged-python-ast"
+            return readers, 0, "unchanged-python-ast" + reason_suffix
 
         compile(new, path, "exec")
         sites = self.equality_sites.get(path)
-        if len(changed_files) == 1 and sites and observed_equalities_only(old, new, sites):
-            return readers | self.uncovered, 0, "observed-identity-equality-agreement"
         changes = Changes()
         factories = {name for name, origin in evidence["deferred_factories"].items() if origin not in changed_files}
         configuration_readers = evidence.get("configuration_readers", {}) if len(changed_files) == 1 else {}
         if (not same_syntax(old.type_ignores, new.type_ignores)
                 or not classify_statements(old.body, new.body, changes, factories, configuration_readers)):
-            raise UnsupportedPatch("Python declarations or imports changed shape")
+            detail = f" ({rejected})" if rejected else ""
+            raise UnsupportedPatch(f"{path}: Python declarations or imports changed shape{detail}")
 
         observed_file = int(evidence["file"], 16)
         selected = readers | self.uncovered
+        eager_lines = evidence.get("eager_lines", ())
+        if any(binding.eager_call for binding in changes.bindings):
+            raise UnsupportedPatch(f"{path}: import-time registration call changed")
+        functions = []
+        for old_function, new_function in changes.functions:
+            if not is_eager(old_function, eager_lines):
+                functions.append((old_function, new_function))
+                continue
+            deferred = deferred_functions(old_function, new_function, eager_lines)
+            if not deferred:
+                raise UnsupportedPatch(f"{path}: import-time function {old_function.name} changed")
+            functions.extend(deferred)
+            selected |= int(self.position_observers or "0", 16)
+            reason_suffix += "+deferred-closure"
+        changes.functions = functions
+        if len(changed_files) == 1 and sites and observed_equalities_only(old, new, sites):
+            return selected, 0, "observed-identity-equality-agreement" + reason_suffix
         if configuration_readers and len(changes.bindings) == 1 and not changes.functions:
             binding = changes.bindings[0]
             if binding.owner and binding.integer_value:
                 key = f"{binding.owner}:{binding.name}"
                 configuration = int(configuration_readers.get(key, "0"), 16)
                 if configuration:
-                    return selected | configuration, observed_file, "configuration-readers"
+                    return selected | configuration, observed_file, "configuration-readers" + reason_suffix
         if any(binding.requires_readers for binding in changes.bindings):
             raise UnsupportedPatch("configuration value edit requires an isolated patch")
 
@@ -345,7 +434,21 @@ class ImpactIndex:
         if omitted_file_tests and extra_milliseconds <= WORKER_COST_MILLISECONDS:
             selected |= observed_file
             reason += "+cheap-file-tests"
-        return selected, observed_file, reason
+        comparisons = self.integer_sites.get(path, {})
+        if (comparisons and self.position_observers is not None and len(changed_files) == 1 and not reason_suffix
+                and len(changes.functions) == 1 and not changes.bindings):
+            site = single_integer_operator_site(*changes.functions[0])
+            if observations := comparisons.get(site):
+                boundary, uncertain, removable = (int(mask, 16) for mask in observations[:3])
+                required = readers | int(self.position_observers, 16) | self.uncovered | boundary | uncertain
+                selected = (selected & ~removable) | required
+                observed_file &= ~removable
+                if len(observations) == 4:
+                    detail = f":{observations[3]}"
+                else:
+                    detail = "" if removable else ":no-confirmed-nonboundary"
+                reason += f"+integer-boundary{detail}"
+        return selected, observed_file, reason + reason_suffix
 
     def selection(self, patch: Path, tests: list[dict]) -> Selection:
         selected, nearby = 0, 0

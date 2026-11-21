@@ -14,6 +14,10 @@ For a local expression edit inside a stable statement, the selector looks for te
 
 The optional predicate index measures whether native equality and identity agree on operands seen by the pinned test suite. It only uses sites where the probe recorded agreement and corroborated subprocess execution where applicable. The shortcut requires the entire patch to preserve its operands and change only the comparison operators in one file. Raw source readers and tests with missing coverage still run.
 
+The selector compares compiled CPython 3.13 code before treating a trailing module `pass` as redundant. Cold-import traces and direct calls identify functions that execute during module or class initialization. A change to the executed part of one of these functions, or to an eager registration call, schedules the full suite while dynamic consumers have incomplete coverage. A supported local edit to an uncalled closure uses that closure's coverage.
+
+For a single ordered comparison of exact built-in integers, phase and process-pool evidence identifies tests that reached the comparison without hitting equality. The selector retains readers, equality hits, and uncertain observations. A shared fixture or unattributed invocation keeps the broader schedule.
+
 `impact_index.json.gz` is generated from the unpatched SQLGlot checkout and test manifest. The runtime matches coverage by pytest node ID to use the test numbers supplied with the current batch. The image contains the selector and index and makes its decisions offline without running pytest. Public answers are used by the separate local scorer.
 
 ## Scheduling
