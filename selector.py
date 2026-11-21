@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+from time import process_time_ns
 from pathlib import Path
 
 from impact import ImpactIndex, Selection
@@ -19,13 +20,20 @@ def main() -> None:
     parser.add_argument("--impact-index", type=Path, default=INDEX)
     parser.add_argument("--all-tests", action="store_true", help="schedule the full suite for every patch")
     parser.add_argument("--explain", action="store_true", help="write the selection evidence to stderr")
+    parser.add_argument("--no-module-pass", action="store_true", help="disable the compiled module-tail proof")
+    parser.add_argument("--no-integer-comparisons", action="store_true", help="disable per-test ordered comparisons")
+    parser.add_argument("--no-numeric-comparisons", action="store_true", help="disable the exact-float extension")
+    parser.add_argument("--no-numeric-escapes", action="store_true", help="disable per-key tokenizer escape readers")
     args = parser.parse_args()
     tests = json.loads((args.data_dir / "tests.json").read_text(encoding="utf-8"))["tests"]
 
     index = None
     if not args.all_tests:
         try:
-            index = ImpactIndex(args.impact_index, tests)
+            index = ImpactIndex(args.impact_index, tests, module_pass=not args.no_module_pass,
+                                integer_comparisons=not args.no_integer_comparisons,
+                                numeric_comparisons=not args.no_numeric_comparisons,
+                                numeric_escapes=not args.no_numeric_escapes)
         except (OSError, EOFError, ValueError, KeyError) as error:
             print(f"Impact index unavailable. Scheduling the full suite. {error}", file=sys.stderr)
 
@@ -35,6 +43,7 @@ def main() -> None:
     full_cost = schedule_cost(full_workers, durations)
     schedules = {full_key: (full_workers, full_cost)}
     for patch in sorted((args.data_dir / "commits").glob("*.patch")):
+        started = process_time_ns() if args.explain else 0
         selection = index.selection(patch, tests) if index else Selection(tests, [], {"full-suite": True})
         key = tuple(sorted(test["number"] for test in selection.tests))
         if key not in schedules:
@@ -42,13 +51,14 @@ def main() -> None:
             schedules[key] = (workers, schedule_cost(workers, durations))
         workers, cost = schedules[key]
         if key != full_key and cost >= full_cost:
-            selection = Selection(tests, [], {"full-suite": "equal or lower simulated cost"})
+            selection = Selection(tests, [], {**selection.evidence, "full-suite": "equal or lower simulated cost"})
             workers = full_workers
         workers = fill_spare_capacity(workers, selection.tests, selection.nearby)
         print(json.dumps({"commit": patch.stem, "workers": workers}, separators=(",", ":")))
         if args.explain:
             selected = sum(map(len, workers))
             print(json.dumps({"commit": patch.stem, "selected": selected, "workers": len(workers),
+                              "process_cpu_us": (process_time_ns() - started) // 1000,
                               "filled_spare_capacity": selected - len(selection.tests),
                               "evidence": selection.evidence}, separators=(",", ":")), file=sys.stderr)
 
