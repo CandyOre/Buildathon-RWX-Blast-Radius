@@ -1,6 +1,6 @@
 # RWX Buildathon · Blast Radius
 
-This entry selects SQLGlot tests from patch impact evidence and schedules the selected tests under the scorer's cost model. On the 30 public patches it scores **134.959 simulated seconds with 0 misses**, compared with **139.911 seconds** before narrowing T-SQL configuration reads and **1,104.510 seconds** with the same scheduler running the full suite. Hidden patches are independently evaluated.
+This entry selects SQLGlot tests from whole-patch impact evidence and schedules them under the scorer's cost model. It records **135.653 simulated seconds with 0 misses** on the 30 public regressions. On the 14 independently frozen mixed patches, the three-run local median including CPU is **170.711 seconds**, down from 303.137 seconds in a clean-build comparison.
 
 ## Test selection
 
@@ -10,11 +10,15 @@ Dictionary key changes and set membership changes in declarations take the full-
 
 The configuration-read index is enabled for `TSQL.WEEK_OFFSET`. It records the owning class and test for each measured read, including reads in spawned pool tasks. An isolated integer value edit can use those readers plus raw source readers and tests whose coverage is missing. Unattributed or unresolved reads prevent the builder from enabling the affected target.
 
+For a value change to an existing numeric escape key, the index tracks actual scanner lookups through inheritance and constructor calls. The selector retains raw source readers, code observers, and tests with missing coverage.
+
 For a local expression edit inside a stable statement, the selector looks for tests that enter the entire statement or condition. This includes the beginning of a short-circuit condition even when its modified operand was skipped on the baseline. It keeps cheap function-level candidates and uses whole-function coverage where execution was unattributed, serialization is involved, or the finer evidence is missing.
 
 The optional predicate index measures whether native equality and identity agree on operands seen by the pinned test suite. It only uses sites where the probe recorded agreement and corroborated subprocess execution where applicable. The shortcut requires the entire patch to preserve its operands and change only the comparison operators in one file. Raw source readers and tests with missing coverage still run.
 
-`impact_index.json.gz` is generated from the unpatched SQLGlot checkout and test manifest. The runtime matches coverage by pytest node ID to use the test numbers supplied with the current batch. The image contains the selector and index and makes its decisions offline without running pytest. Public answers are used by the separate local scorer.
+For a single ordered comparison edit, the arithmetic probe records tests that can observe a change at the equality boundary. Its floating-point extension applies to exact built-in numbers at sites where the integer and numeric probes agree on execution contexts and the extra evidence can remove a long test.
+
+`impact_index.json.gz` is generated from the unpatched SQLGlot checkout and test manifest. The runtime maps evidence to test numbers using pytest node IDs. The image also contains the pinned SQLGlot source, tests and fixtures. It uses isolated, bounded subprocesses for selected cold-import comparisons or proof-backed replay when the scheduled savings justify the cost. Public answers are used by the separate local scorer.
 
 ## Scheduling
 

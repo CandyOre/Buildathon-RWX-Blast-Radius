@@ -11,6 +11,9 @@ from pathlib import Path
 
 from equivalent_edits import normalize_module_tail
 from patch_diff import UnsupportedPatch, parse_patch
+from round3_guards import guard_proof
+from round3_runtime import BASELINE, relative_source
+from round3_semantics import control_masks, normalize_python
 from scheduler import WORKER_COST_MILLISECONDS, test_milliseconds
 
 
@@ -19,6 +22,8 @@ FUNCTION = (ast.FunctionDef, ast.AsyncFunctionDef)
 CONTAINERS = (ast.Dict, ast.List, ast.Tuple, ast.Set)
 EQUALITY_FOR = {ast.Is: ast.Eq, ast.IsNot: ast.NotEq}
 BOUNDARY_FOR = {ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE, ast.GtE: ast.Gt}
+SERIALIZATION_HOOKS = {"__reduce__", "__reduce_ex__", "__getstate__", "__setstate__",
+                       "__getnewargs__", "__getnewargs_ex__"}
 
 
 @dataclass
@@ -45,6 +50,7 @@ class Selection:
     tests: list[dict]
     nearby: list[dict]
     evidence: dict
+    applied: dict = field(default_factory=dict)
 
 
 def same_syntax(old, new):
@@ -311,7 +317,7 @@ def deferred_functions(old, new, eager_lines):
 
 class ImpactIndex:
     def __init__(self, path: Path, tests: list[dict], *, module_pass=True, integer_comparisons=True,
-                 numeric_comparisons=True, numeric_escapes=True):
+                 numeric_comparisons=True, numeric_escapes=True, semantics=True, control=True, baseline=BASELINE):
         with gzip.open(path, "rt", encoding="utf-8") as stream:
             self.index = json.load(stream)
         if self.index["version"] != 1 or self.index["revision"] != REVISION:
@@ -327,6 +333,12 @@ class ImpactIndex:
         self.numeric_sites = (self.index.get("numeric_comparison_sites", {})
                               if integer_comparisons and numeric_comparisons else {})
         self.numeric_escapes = numeric_escapes
+        self.semantics = semantics
+        self.control = control
+        self.baseline = baseline
+        self.test_files = {}
+        for bit, test, _ in self.known:
+            self.test_files[test["file"]] = self.test_files.get(test["file"], 0) | bit
         self.cheap = 0
         for bit, _, milliseconds in self.known:
             if milliseconds <= WORKER_COST_MILLISECONDS // 20:
@@ -336,7 +348,7 @@ class ImpactIndex:
         self.trees = {}
         self.line_masks = {}
 
-    def file_bits(self, path, evidence, functions):
+    def file_bits(self, path, evidence, functions, *, broad=False):
         if path not in self.line_masks:
             self.line_masks[path] = {int(line): int(mask, 16) for line, mask in evidence["lines"].items()}
         covered_lines = self.line_masks[path]
@@ -350,7 +362,7 @@ class ImpactIndex:
                 witnesses |= covered_lines.get(line, 0)
             if not witnesses:
                 witnesses = int(evidence["file"], 16)
-            elif not counterpart and background.isdisjoint(body):
+            elif not broad and not counterpart and background.isdisjoint(body):
                 regions = statement_regions(old.body, new.body)
                 if regions:
                     anchored = 0
@@ -369,9 +381,7 @@ class ImpactIndex:
             unscoped |= not background.isdisjoint(body)
         return bits, unscoped, narrowed
 
-    def source_impact(self, change, evidence, changed_files):
-        path = change.path
-        patched = change.apply(evidence["source"])
+    def source_impact(self, path, patched, evidence, changed_files):
         if path not in self.trees:
             self.trees[path] = ast.parse(evidence["source"], filename=path, type_comments=True)
         old = self.trees[path]
@@ -388,8 +398,19 @@ class ImpactIndex:
                 reason_suffix = "+compiled-module-pass"
                 if positions_changed:
                     readers |= int(self.position_observers, 16) | self.uncovered
+        if self.semantics and not normalized:
+            proof = normalize_python(evidence["source"], patched, path, old, new)
+            if proof and not (proof[1] == "compiled-equivalent-local-names" and len(changed_files) > 1):
+                new, reason, keep_positions = proof
+                reason_suffix = f"+{reason}"
+                if keep_positions:
+                    if self.position_observers is None:
+                        raise UnsupportedPatch("source-position witnesses unavailable")
+                    readers |= int(self.position_observers, 16) | self.uncovered
         if same_syntax(old, new):
             return readers, 0, "unchanged-python-ast" + reason_suffix
+        if self.control and len(changed_files) == 1 and guard_proof(path, old, new, self.index):
+            return readers | int(self.position_observers or "0", 16) | self.uncovered, 0, "inactive-entry-guard"
 
         compile(new, path, "exec")
         sites = self.equality_sites.get(path)
@@ -408,6 +429,8 @@ class ImpactIndex:
             raise UnsupportedPatch(f"{path}: import-time registration call changed")
         functions = []
         for old_function, new_function in changes.functions:
+            if old_function.name in SERIALIZATION_HOOKS:
+                raise UnsupportedPatch(f"{path}: serialization protocol {old_function.name} changed")
             if not is_eager(old_function, eager_lines):
                 functions.append((old_function, new_function))
                 continue
@@ -425,7 +448,8 @@ class ImpactIndex:
             tables = evidence.get("numeric_escape_readers", {})
             if binding.escape_key in tables.get(binding.owner, {}):
                 witnesses = int(tables[binding.owner][binding.escape_key], 16)
-                return selected | witnesses | int(self.position_observers or "0", 16), 0, "escape-key-readers"
+                return (selected | witnesses | int(self.position_observers or "0", 16), 0,
+                        "escape-key-readers" + reason_suffix)
         if configuration_readers and len(changes.bindings) == 1 and not changes.functions:
             binding = changes.bindings[0]
             if binding.owner and binding.integer_value:
@@ -438,11 +462,12 @@ class ImpactIndex:
 
         reason = "function-coverage"
         if changes.functions:
-            functions, unscoped, narrowed = self.file_bits(path, evidence, changes.functions)
+            multi_source = self.semantics and sum(file.startswith("sqlglot/") for file in changed_files) > 1
+            functions, unscoped, narrowed = self.file_bits(path, evidence, changes.functions, broad=multi_source)
             if not functions:
                 raise UnsupportedPatch("changed functions lack baseline evidence")
             selected |= functions
-            if unscoped:
+            if unscoped or multi_source:
                 selected |= int(evidence["reverse_importers"], 16)
                 reason = "function-coverage-and-importers"
             elif narrowed:
@@ -489,30 +514,66 @@ class ImpactIndex:
                     detail = "" if removable else ":no-confirmed-nonboundary"
                 kind = "numeric" if extended and extended != exact else "integer"
                 reason += f"+{kind}-boundary{detail}"
+        if self.control and len(changed_files) == 1 and len(changes.functions) == 1 and not changes.bindings:
+            proof = control_masks(path, *changes.functions[0], self.index)
+            if proof:
+                witnesses, removable, control_reason = proof
+                required = readers | int(self.position_observers or "0", 16) | self.uncovered | witnesses
+                selected = (selected & ~removable) | required
+                observed_file &= ~removable
+                reason += f"+{control_reason}"
         return selected, observed_file, reason + reason_suffix
+
+    def applied_tree(self, changes):
+        applied = {}
+        for change in changes:
+            file = self.index["files"].get(change.path)
+            if file:
+                before = file["source"]
+            elif self.baseline.is_dir():
+                before = relative_source(self.baseline, change.path).read_bytes().decode("utf-8")
+            elif change.path in self.index["fixtures"]:
+                continue
+            else:
+                raise UnsupportedPatch("file has no baseline impact data")
+            applied[change.path] = before, change.apply(before)
+        return applied
 
     def selection(self, patch: Path, tests: list[dict]) -> Selection:
         selected, nearby = 0, 0
         evidence_used = Counter()
+        applied = {}
         try:
             changes = parse_patch(patch.read_text(encoding="utf-8"))
             changed_files = {change.path for change in changes}
+            applied = self.applied_tree(changes)
             for change in changes:
                 if change.path in self.index["fixtures"]:
                     bits, related, reason = int(self.index["fixtures"][change.path], 16), 0, "fixture-owners"
                 elif change.path in self.index["files"]:
-                    bits, related, reason = self.source_impact(change, self.index["files"][change.path], changed_files)
+                    bits, related, reason = self.source_impact(change.path, applied[change.path][1],
+                                                              self.index["files"][change.path], changed_files)
+                elif self.semantics and change.path in self.test_files:
+                    before, after = applied[change.path]
+                    old = ast.parse(before, filename=change.path, type_comments=True)
+                    new = ast.parse(after, filename=change.path, type_comments=True)
+                    proof = normalize_python(before, after, change.path, old, new)
+                    if not proof or not same_syntax(old, proof[0]):
+                        raise UnsupportedPatch(f"{change.path}: test execution or shared state changed")
+                    bits, related, reason = self.test_files[change.path], 0, "test-source-observers"
+                    bits |= int(self.position_observers or "0", 16)
                 else:
                     raise UnsupportedPatch("file has no baseline impact data")
                 selected |= bits
                 nearby |= related
                 evidence_used[reason] += 1
         except (OSError, SyntaxError, ValueError, RecursionError) as error:
-            return Selection(tests, [], {"full-suite": str(error)})
+            return Selection(tests, [], {"full-suite": str(error)}, applied)
         return Selection(
             [test for bit, test, _ in self.known if bit & selected] + self.unknown,
             [test for bit, test, _ in self.known if bit & nearby and not bit & selected],
             dict(evidence_used),
+            applied,
         )
 
     def select(self, patch: Path, tests: list[dict]):
